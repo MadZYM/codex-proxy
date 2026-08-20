@@ -7,6 +7,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: dev-websocket-acceptance-20260820
+  cancel-in-progress: true
+
 jobs:
   accept:
     runs-on: ubuntu-latest
@@ -20,10 +24,15 @@ jobs:
         with:
           components: rustfmt,clippy
 
-      - name: Extract and apply implementation patch
+      - name: Apply, test, and publish result
         shell: bash
         run: |
-          python3 <<'PY'
+          set +e
+          rm -f .ci-websocket-status.txt .ci-websocket.log
+          status=0
+
+          echo '===== extract implementation patch =====' | tee .ci-websocket.log
+          python3 <<'PY' 2>&1 | tee -a .ci-websocket.log
           from pathlib import Path
           text = Path('.github/workflows/dev-websocket-acceptance.yml').read_text()
           marker = "          python3 <<'PY'\n"
@@ -36,15 +45,16 @@ jobs:
           ) + "\n"
           Path('/tmp/apply-websocket.py').write_text(script)
           PY
-          python3 /tmp/apply-websocket.py
+          rc=${PIPESTATUS[0]}
+          if [ "$rc" -ne 0 ]; then status=$rc; fi
 
-      - name: Run automated acceptance and record output
-        id: acceptance
-        shell: bash
-        run: |
-          set +e
-          rm -f .ci-websocket-status.txt .ci-websocket.log
-          status=0
+          if [ "$status" -eq 0 ]; then
+            echo '===== apply implementation patch =====' | tee -a .ci-websocket.log
+            python3 /tmp/apply-websocket.py 2>&1 | tee -a .ci-websocket.log
+            rc=${PIPESTATUS[0]}
+            if [ "$rc" -ne 0 ]; then status=$rc; fi
+          fi
+
           run_check() {
             name="$1"
             shift
@@ -54,44 +64,33 @@ jobs:
             if [ "$rc" -ne 0 ]; then
               echo "FAILED: $name (exit $rc)" | tee -a .ci-websocket.log
               status=$rc
-              return 1
             fi
           }
-          run_check format cargo fmt --all || true
-          if [ "$status" -eq 0 ]; then run_check format-check cargo fmt --all -- --check || true; fi
-          if [ "$status" -eq 0 ]; then run_check diff-check git diff --check || true; fi
-          if [ "$status" -eq 0 ]; then run_check check cargo check --all-targets || true; fi
-          if [ "$status" -eq 0 ]; then run_check clippy cargo clippy --all-targets -- -D warnings || true; fi
-          if [ "$status" -eq 0 ]; then run_check tests cargo test --all-targets || true; fi
-          if [ "$status" -eq 0 ]; then run_check release cargo build --release || true; fi
-          if [ "$status" -eq 0 ]; then
-            echo PASS > .ci-websocket-status.txt
-          else
-            echo FAIL > .ci-websocket-status.txt
-          fi
-          echo "status=$status" >> "$GITHUB_OUTPUT"
-          exit 0
 
-      - name: Commit result
-        shell: bash
-        run: |
+          if [ "$status" -eq 0 ]; then run_check format cargo fmt --all; fi
+          if [ "$status" -eq 0 ]; then run_check format-check cargo fmt --all -- --check; fi
+          if [ "$status" -eq 0 ]; then run_check diff-check git diff --check; fi
+          if [ "$status" -eq 0 ]; then run_check check cargo check --all-targets; fi
+          if [ "$status" -eq 0 ]; then run_check clippy cargo clippy --all-targets -- -D warnings; fi
+          if [ "$status" -eq 0 ]; then run_check tests cargo test --all-targets; fi
+          if [ "$status" -eq 0 ]; then run_check release cargo build --release; fi
+
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          status='${{ steps.acceptance.outputs.status }}'
-          if [ "$status" = "0" ]; then
-            rm -f .ci-websocket-status.txt .ci-websocket.log
-            git add -- Cargo.toml Cargo.lock README.md src/main.rs src/server.rs src/upstream.rs src/websocket.rs
-            if git diff --cached --quiet; then
-              echo "No implementation changes to commit"
-              exit 0
-            fi
-            git commit -m "feat: proxy Codex Responses over WebSocket"
-          else
-            git add -- .ci-websocket-status.txt .ci-websocket.log
-            git commit -m "ci: record websocket acceptance failure"
-          fi
-          git push origin HEAD:ci/websocket-acceptance-20260820
 
-      - name: Fail workflow after publishing diagnostics
-        if: steps.acceptance.outputs.status != '0'
-        run: exit 1
+          if [ "$status" -eq 0 ]; then
+            echo PASS > .ci-websocket-status.txt
+            git rm -f --ignore-unmatch .ci-websocket-status.txt .ci-websocket.log >/dev/null 2>&1 || true
+            git add -- Cargo.toml Cargo.lock README.md src/main.rs src/server.rs src/upstream.rs src/websocket.rs
+            if ! git diff --cached --quiet; then
+              git commit -m "feat: proxy Codex Responses over WebSocket"
+              git push origin HEAD:ci/websocket-acceptance-20260820
+            fi
+            exit 0
+          fi
+
+          echo FAIL > .ci-websocket-status.txt
+          git add -- .ci-websocket-status.txt .ci-websocket.log
+          git commit -m "ci: record websocket acceptance failure"
+          git push origin HEAD:ci/websocket-acceptance-20260820
+          exit "$status"
