@@ -49,6 +49,13 @@ jobs:
           if [ "$rc" -ne 0 ]; then status=$rc; fi
 
           if [ "$status" -eq 0 ]; then
+            echo '===== normalize implementation patch =====' | tee -a .ci-websocket.log
+            python3 .github/ws-patch-script-fix.py 2>&1 | tee -a .ci-websocket.log
+            rc=${PIPESTATUS[0]}
+            if [ "$rc" -ne 0 ]; then status=$rc; fi
+          fi
+
+          if [ "$status" -eq 0 ]; then
             echo '===== apply implementation patch =====' | tee -a .ci-websocket.log
             python3 /tmp/apply-websocket.py 2>&1 | tee -a .ci-websocket.log
             rc=${PIPESTATUS[0]}
