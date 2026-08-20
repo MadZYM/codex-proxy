@@ -1,6 +1,9 @@
 ===== extract implementation patch =====
 ===== normalize implementation patch =====
+===== apply implementation patch =====
 Traceback (most recent call last):
-  File "/home/runner/work/codex-proxy/codex-proxy/.github/ws-patch-script-fix.py", line 54, in <module>
-    raise RuntimeError(f'expected one malformed constructor block, found {count}')
-RuntimeError: expected one malformed constructor block, found 0
+  File "/tmp/apply-websocket.py", line 185, in <module>
+    replace_once(
+  File "/tmp/apply-websocket.py", line 8, in replace_once
+    raise RuntimeError(f"{path}: expected one match, found {count}: {old[:120]!r}")
+RuntimeError: src/upstream.rs: expected one match, found 0: '        Self {\n        http,\n        pool,\n        next: AtomicUsize::new(0),\n        account_cooldown: Duration::from_s'
