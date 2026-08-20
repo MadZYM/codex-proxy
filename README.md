@@ -65,7 +65,10 @@ model = "gpt-5-codex"
 ## Endpoints
 
 - `POST /v1/chat/completions` — Chat Completions, translated to/from Codex Responses (stream or buffered).
-- `POST /v1/responses` — raw passthrough to the Codex Responses API.
+- `POST /v1/responses` — raw HTTP/SSE passthrough to the Codex Responses API.
+- `GET /v1/responses` with a WebSocket Upgrade — transparent official Codex
+  Responses WebSocket transport; multiple `response.create` frames, prewarm,
+  incremental `previous_response_id`, tools, reasoning, and unknown events pass through.
 - `GET /v1/models`, `GET /health`.
 
 Function tools are reshaped to the Responses form; hosted tools (`web_search`,
@@ -76,8 +79,10 @@ original status and body.
 both ways (`session-id`, `thread-id`, `x-client-request-id`, the current
 `x-codex-*` compatibility metadata, and sticky-routing `x-codex-turn-state`).
 For ChatGPT Codex upstream requests it generates the official
-`x-codex-routing-hint` from the raw body's `model` and optional `service_tier`;
-the body itself remains byte-for-byte unchanged. `x-codex-turn-state` only gets
+`x-codex-routing-hint` from the raw HTTP body's, or the first WebSocket
+`response.create` frame's, `model` and optional `service_tier`; payloads remain
+unchanged. The WebSocket handshake and OAuth refresh use the same
+`CODEXPROXY_PROXY` configuration as HTTP/SSE. `x-codex-turn-state` only gets
 relayed when there's exactly one pool account — with multiple accounts it's tied
 to whichever one issued it, so it's dropped instead of replayed against the wrong
 account.
