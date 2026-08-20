@@ -148,6 +148,10 @@ impl Upstream {
         body: bytes::Bytes,
         client_headers: &reqwest::header::HeaderMap,
     ) -> Result<ForwardedResponse, ProxyError> {
+        // Current Codex main sends a backend routing hint derived from the
+        // resolved request model and optional service tier. Parse once per
+        // client request; the original bytes are still forwarded unchanged.
+        let routing_hint = build_routing_hint_header(&body);
         let pool_len = self.pool.len();
         let mut tried = vec![false; pool_len];
         let mut last_response = None;
@@ -165,7 +169,13 @@ impl Upstream {
             tried[idx] = true;
 
             match self
-                .try_account(&auth_mgr, &account, body.clone(), client_headers)
+                .try_account(
+                    &auth_mgr,
+                    &account,
+                    body.clone(),
+                    client_headers,
+                    routing_hint.as_ref(),
+                )
                 .await
             {
                 Ok(response) => {
@@ -213,10 +223,11 @@ impl Upstream {
         account: &str,
         body: bytes::Bytes,
         client_headers: &reqwest::header::HeaderMap,
+        routing_hint: Option<&reqwest::header::HeaderValue>,
     ) -> Result<reqwest::Response, ProxyError> {
         let auth = auth_mgr.headers().await?;
         let response = self
-            .send_once(&auth, body.clone(), client_headers, account)
+            .send_once(&auth, body.clone(), client_headers, routing_hint, account)
             .await?;
         if response.status() != reqwest::StatusCode::UNAUTHORIZED {
             return Ok(response);
@@ -224,7 +235,7 @@ impl Upstream {
 
         tracing::info!(%account, "401 from upstream; forcing token refresh and retrying once");
         let refreshed = auth_mgr.force_refresh_headers().await?;
-        self.send_once(&refreshed, body, client_headers, account)
+        self.send_once(&refreshed, body, client_headers, routing_hint, account)
             .await
     }
 
@@ -233,6 +244,7 @@ impl Upstream {
         auth: &crate::auth::AuthHeaders,
         body: bytes::Bytes,
         client_headers: &reqwest::header::HeaderMap,
+        routing_hint: Option<&reqwest::header::HeaderValue>,
         account: &str,
     ) -> Result<reqwest::Response, ProxyError> {
         let mut req = self
@@ -247,6 +259,9 @@ impl Upstream {
 
         if let Some(account_id) = &auth.account_id {
             req = req.header("ChatGPT-Account-ID", account_id.clone());
+        }
+        if let Some(routing_hint) = routing_hint {
+            req = req.header(X_CODEX_ROUTING_HINT_HEADER, routing_hint.clone());
         }
 
         for name in SESSION_IDENTITY_HEADERS {
@@ -275,6 +290,27 @@ impl Upstream {
             ProxyError::Upstream(format!("forward to responses failed: {e}"))
         })
     }
+}
+
+const X_CODEX_ROUTING_HINT_HEADER: &str = "x-codex-routing-hint";
+
+/// Generate the ChatGPT Codex routing hint using the exact current upstream format:
+/// `model=<model>` or `model=<model>;tier=<service_tier>`.
+///
+/// This deliberately reads only two top-level JSON fields and never serializes the
+/// payload again, so tools, reasoning, encrypted reasoning, streaming flags, and
+/// unknown Responses fields remain byte-for-byte untouched.
+fn build_routing_hint_header(body: &[u8]) -> Option<reqwest::header::HeaderValue> {
+    let payload: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let model = payload.get("model")?.as_str()?;
+    let hint = match payload
+        .get("service_tier")
+        .and_then(serde_json::Value::as_str)
+    {
+        Some(tier) => format!("model={model};tier={tier}"),
+        None => format!("model={model}"),
+    };
+    hint.parse().ok()
 }
 
 /// Upstream statuses that mean "this account can't serve the request right
@@ -312,6 +348,11 @@ pub(crate) fn is_account_failure(status: reqwest::StatusCode) -> bool {
 /// `x-openai-internal-codex-residency`, an enterprise residency-enforcement
 /// header that has no business being set by an untrusted client — into a
 /// pooled-account upstream request.
+///
+/// `x-codex-routing-hint` is intentionally generated from the request body above,
+/// not trusted from the client. For ordinary HTTP Responses requests, current Codex
+/// carries `x-codex-installation-id` inside `client_metadata`; the raw body already
+/// preserves it, so the proxy does not invent or relay a separate installation header.
 const SESSION_IDENTITY_HEADERS: &[&str] = &[
     "session-id",
     "thread-id",
@@ -352,13 +393,14 @@ pub(crate) const CODEX_SESSION_RESPONSE_HEADERS: &[&str] = &[
     "x-codex-turn-state",
 ];
 
-/// Build a User-Agent byte-for-byte identical to the official Codex CLI:
+/// Build the stable Codex CLI identity prefix used by this proxy:
 ///   `{originator}/{cli_version} ({OsType} {os_version}; {arch})`
 ///
-/// No `codex-proxy` suffix (that would fingerprint the proxy to ChatGPT), and
-/// `cli_version` is the impersonated Codex CLI release from config — not this
-/// crate's own version. The OS/arch are read from `os_info` at runtime so the
-/// string always reflects the real host instead of a hardcoded guess.
+/// The official interactive CLI appends a terminal token after this prefix. A
+/// detached/containerized proxy has no truthful client-terminal value to add, so it
+/// keeps the existing prefix rather than fabricating one. There is no `codex-proxy`
+/// suffix, and `cli_version` is the configured upstream identity version — not this
+/// crate's own version.
 fn build_user_agent(originator: &str, cli_version: &str) -> String {
     let info = os_info::get();
     format!(
@@ -517,6 +559,12 @@ mod tests {
         turn_state: Option<String>,
         residency: Option<String>,
         client_request_id: Option<String>,
+        routing_hint: Option<String>,
+        originator: Option<String>,
+        version: Option<String>,
+        user_agent: Option<String>,
+        installation_id: Option<String>,
+        body: bytes::Bytes,
     }
 
     impl FakeHeaderEcho {
@@ -541,12 +589,12 @@ mod tests {
         }
     }
 
-    /// Captures the two headers under test, then replies with its own
-    /// `x-codex-turn-state` — mirroring how the real Codex backend returns a
-    /// fresh sticky-routing token for the client to replay next turn.
+    /// Captures the upstream identity/session headers and raw body, then replies
+    /// with its own `x-codex-turn-state` — mirroring the real backend.
     async fn echo_headers(
         State(tx): State<mpsc::Sender<CapturedHeaders>>,
         headers: HeaderMap,
+        body: bytes::Bytes,
     ) -> Response {
         let captured = CapturedHeaders {
             turn_state: headers
@@ -561,6 +609,27 @@ mod tests {
                 .get("x-client-request-id")
                 .and_then(|v| v.to_str().ok())
                 .map(str::to_string),
+            routing_hint: headers
+                .get("x-codex-routing-hint")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string),
+            originator: headers
+                .get("originator")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string),
+            version: headers
+                .get("version")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string),
+            user_agent: headers
+                .get("user-agent")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string),
+            installation_id: headers
+                .get("x-codex-installation-id")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string),
+            body,
         };
         tx.send(captured).await.unwrap();
         Response::builder()
@@ -568,6 +637,56 @@ mod tests {
             .header("x-codex-turn-state", "server-issued-token")
             .body(Body::from(r#"{"ok":true}"#))
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn upstream_identity_and_routing_hint_match_current_codex_behavior() {
+        let mut fake = start_fake_header_echo().await;
+        let upstream = test_pool(&fake.base_url, 1).await;
+        let body = bytes::Bytes::from_static(
+            br#"{"model":"gpt-5.6-sol","service_tier":"priority","client_metadata":{"x-codex-installation-id":"client-installation"},"future_field":{"kept":true}}"#,
+        );
+
+        let mut client_headers = HeaderMap::new();
+        // Neither value is blindly relayed. The routing hint is rebuilt from
+        // the actual payload, and current official HTTP requests have no
+        // standalone `version` header.
+        client_headers.insert(
+            "x-codex-routing-hint",
+            HeaderValue::from_static("model=spoofed;tier=priority"),
+        );
+        client_headers.insert("version", HeaderValue::from_static("999.0.0"));
+
+        upstream
+            .forward_responses(body.clone(), &client_headers)
+            .await
+            .unwrap();
+
+        let captured = fake.recv().await;
+        assert_eq!(captured.body, body);
+        assert_eq!(captured.originator.as_deref(), Some("codex_cli_rs"));
+        assert_eq!(captured.version, None);
+        assert!(captured
+            .user_agent
+            .as_deref()
+            .expect("upstream user-agent")
+            .starts_with(&format!(
+                "codex_cli_rs/{} (",
+                crate::config::DEFAULT_CLI_VERSION
+            )));
+        assert_eq!(
+            captured.routing_hint.as_deref(),
+            Some("model=gpt-5.6-sol;tier=priority")
+        );
+        // Ordinary Responses requests carry this in client_metadata, not
+        // as a direct header. The raw body assertion above proves it survives.
+        assert_eq!(captured.installation_id, None);
+    }
+
+    #[test]
+    fn routing_hint_omits_tier_when_service_tier_is_absent() {
+        let value = build_routing_hint_header(br#"{"model":"gpt-5.6-sol"}"#).expect("routing hint");
+        assert_eq!(value.to_str().unwrap(), "model=gpt-5.6-sol");
     }
 
     #[tokio::test]

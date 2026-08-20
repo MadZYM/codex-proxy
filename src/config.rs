@@ -114,11 +114,10 @@ pub struct UpstreamConfig {
     pub issuer: String,
     pub client_id: String,
     pub originator: String,
-    /// Codex CLI version we impersonate in the upstream User-Agent. Only the
-    /// version is configured here; the `(OsType os_version; arch)` part is
-    /// generated from `os_info` at runtime, and there is no `codex-proxy`
-    /// suffix — both so the UA can't fingerprint the proxy to ChatGPT. Bump
-    /// this (or set `CODEXPROXY_CLI_VERSION`) when the real Codex CLI bumps.
+    /// Codex CLI version used in the upstream User-Agent. The official HTTP
+    /// client currently has no standalone `version` header, so this remains
+    /// the single configurable version source. The `(OsType os_version; arch)`
+    /// part is generated from `os_info` at runtime, with no `codex-proxy` suffix.
     pub cli_version: String,
     pub refresh_skew_secs: i64,
     pub request_timeout_secs: u64,
@@ -188,7 +187,7 @@ pub const DEFAULT_CLIENT_KEY: &str = "sk-local-changeme";
 
 /// Default Codex CLI version impersonated in the upstream User-Agent. Bump when
 /// the real Codex CLI bumps, or override via config/`CODEXPROXY_CLI_VERSION`.
-pub const DEFAULT_CLI_VERSION: &str = "0.144.3";
+pub const DEFAULT_CLI_VERSION: &str = "0.147.0";
 
 impl Default for ClientAuthConfig {
     fn default() -> Self {

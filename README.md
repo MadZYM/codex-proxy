@@ -72,12 +72,15 @@ Function tools are reshaped to the Responses form; hosted tools (`web_search`,
 `image_generation`) pass through. Upstream errors are relayed with their
 original status and body.
 
-`/v1/responses` also relays Codex CLI's own turn/session headers both ways
-(`session-id`, `thread-id`, `x-client-request-id`, and the sticky-routing
-`x-codex-turn-state`), so pointing a real `codex` CLI at this proxy doesn't
-lose session continuity. `x-codex-turn-state` only gets relayed when there's
-exactly one pool account — with multiple accounts it's tied to whichever one
-issued it, so it's dropped instead of replayed against the wrong account.
+`/v1/responses` also relays Codex CLI's own allowlisted turn/session headers
+both ways (`session-id`, `thread-id`, `x-client-request-id`, the current
+`x-codex-*` compatibility metadata, and sticky-routing `x-codex-turn-state`).
+For ChatGPT Codex upstream requests it generates the official
+`x-codex-routing-hint` from the raw body's `model` and optional `service_tier`;
+the body itself remains byte-for-byte unchanged. `x-codex-turn-state` only gets
+relayed when there's exactly one pool account — with multiple accounts it's tied
+to whichever one issued it, so it's dropped instead of replayed against the wrong
+account.
 
 ## Logging & token usage
 
