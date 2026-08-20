@@ -10,6 +10,15 @@ def replace_once(path: str, old: str, new: str) -> None:
     file.write_text(text.replace(old, new))
 
 
+def replace_last(path: str, old: str, new: str) -> None:
+    file = Path(path)
+    text = file.read_text()
+    index = text.rfind(old)
+    if index < 0:
+        raise RuntimeError(f"{path}: expected at least one match: {old!r}")
+    file.write_text(text[:index] + new + text[index + len(old):])
+
+
 replace_once(
     "src/upstream.rs",
     """        if !matches!(
@@ -40,7 +49,7 @@ replace_once(
     "return Ok(ForwardedWebSocket { websocket, account });",
     "return Ok(ForwardedWebSocket {\n                            websocket: *websocket,\n                            account,\n                        });",
 )
-replace_once(
+replace_last(
     "src/upstream.rs",
     "Ok(WebSocketAttempt::Connected(websocket))",
     "Ok(WebSocketAttempt::Connected(Box::new(websocket)))",
