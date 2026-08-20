@@ -13,6 +13,7 @@ mod server;
 mod test_support;
 mod translate;
 mod upstream;
+mod websocket;
 
 use std::sync::Arc;
 use std::time::Duration;

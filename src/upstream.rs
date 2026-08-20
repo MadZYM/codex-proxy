@@ -6,6 +6,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use reqwest_websocket::RequestBuilderExt;
+
 use crate::auth::AuthManager;
 use crate::config::UpstreamConfig;
 use crate::error::ProxyError;
@@ -34,12 +36,17 @@ impl PoolEntry {
 
 pub struct Upstream {
     http: reqwest::Client,
+    /// Dedicated HTTP/1.1 client for WebSocket upgrades. It mirrors the normal
+    /// client's TLS, timeout, and configured proxy settings, but does not force
+    /// the existing HTTP/SSE client off HTTP/2.
+    websocket_http: Result<reqwest::Client, String>,
     pool: Vec<PoolEntry>,
     /// Round-robin cursor into `pool`. `Relaxed` is enough — entries only
     /// need even distribution across concurrent requests, not a strict order.
     next: AtomicUsize,
     account_cooldown: Duration,
     responses_url: String,
+    responses_websocket_url: String,
     originator: String,
     user_agent: String,
 }
@@ -50,6 +57,30 @@ pub struct Upstream {
 pub struct ForwardedResponse {
     pub response: reqwest::Response,
     pub account: Arc<str>,
+}
+
+/// A live upstream Responses WebSocket bound to the pool account that
+/// authenticated its handshake. The account stays fixed for the lifetime
+/// of the connection, preserving backend connection/session affinity.
+pub struct ForwardedWebSocket {
+    pub websocket: reqwest_websocket::WebSocket,
+    pub account: Arc<str>,
+}
+
+/// Error surfaced after the downstream upgrade has already completed.
+/// It is serialized as an official-style wrapped WebSocket `error` event.
+#[derive(Debug, Clone)]
+pub struct WebSocketConnectError {
+    pub status: u16,
+    pub message: String,
+}
+
+enum WebSocketAttempt {
+    Connected(Box<reqwest_websocket::WebSocket>),
+    Rejected {
+        status: reqwest::StatusCode,
+        body: String,
+    },
 }
 
 impl Upstream {
@@ -70,6 +101,12 @@ impl Upstream {
             cfg.base_url.trim_end_matches('/'),
             cfg.responses_path
         );
+        let responses_websocket_url = websocket_url(&responses_url);
+        let websocket_http = build_websocket_http_client(cfg)
+            .map_err(|error| format!("building upstream websocket client failed: {error}"));
+        if let Err(error) = &websocket_http {
+            tracing::error!(%error, "upstream websocket client unavailable");
+        }
         let user_agent = build_user_agent(&cfg.originator, &cfg.cli_version);
         // Only announce a "pool" when there actually is one — a single
         // configured account should look and log exactly like before pooling.
@@ -90,10 +127,12 @@ impl Upstream {
             .collect();
         Self {
             http,
+            websocket_http,
             pool,
             next: AtomicUsize::new(0),
             account_cooldown: Duration::from_secs(cfg.account_cooldown_secs),
             responses_url,
+            responses_websocket_url,
             originator: cfg.originator.clone(),
             user_agent,
         }
@@ -214,6 +253,166 @@ impl Upstream {
         }
     }
 
+    /// Open an upstream Responses WebSocket using the model/service tier in
+    /// the first downstream `response.create` frame. The frame itself is not
+    /// consumed or rewritten here; the relay sends the original bytes after the
+    /// handshake succeeds.
+    pub async fn connect_responses_websocket(
+        &self,
+        first_payload: &[u8],
+        client_headers: &reqwest::header::HeaderMap,
+    ) -> Result<ForwardedWebSocket, WebSocketConnectError> {
+        let routing_hint = build_routing_hint_header(first_payload);
+        let pool_len = self.pool.len();
+        let mut tried = vec![false; pool_len];
+        let mut last_error = None;
+
+        for _ in 0..pool_len {
+            let (idx, auth_mgr, account) = self.next_account();
+            if tried[idx] {
+                break;
+            }
+            tried[idx] = true;
+
+            match self
+                .try_account_websocket(&auth_mgr, &account, client_headers, routing_hint.as_ref())
+                .await
+            {
+                Ok(WebSocketAttempt::Connected(websocket)) => {
+                    return Ok(ForwardedWebSocket {
+                        websocket: *websocket,
+                        account,
+                    });
+                }
+                Ok(WebSocketAttempt::Rejected { status, body }) => {
+                    let error = WebSocketConnectError {
+                        status: status.as_u16(),
+                        message: format!(
+                            "upstream websocket handshake rejected for account {account} ({status}): {}",
+                            compact_error_body(&body)
+                        ),
+                    };
+                    if is_account_failure(status) {
+                        self.pool[idx].start_cooldown(self.account_cooldown);
+                        tracing::warn!(
+                            %account,
+                            %status,
+                            "websocket account handshake failed, trying next pool account"
+                        );
+                        last_error = Some(error);
+                        continue;
+                    }
+                    return Err(error);
+                }
+                Err(error) => {
+                    self.pool[idx].start_cooldown(self.account_cooldown);
+                    tracing::warn!(
+                        %account,
+                        error = %error,
+                        "websocket account transport/auth failed, trying next pool account"
+                    );
+                    last_error = Some(WebSocketConnectError {
+                        status: reqwest::StatusCode::BAD_GATEWAY.as_u16(),
+                        message: error.to_string(),
+                    });
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| WebSocketConnectError {
+            status: reqwest::StatusCode::BAD_GATEWAY.as_u16(),
+            message: "upstream websocket account pool is empty".to_string(),
+        }))
+    }
+
+    async fn try_account_websocket(
+        &self,
+        auth_mgr: &AuthManager,
+        account: &str,
+        client_headers: &reqwest::header::HeaderMap,
+        routing_hint: Option<&reqwest::header::HeaderValue>,
+    ) -> Result<WebSocketAttempt, ProxyError> {
+        let auth = auth_mgr.headers().await?;
+        let attempt = self
+            .send_websocket_once(&auth, client_headers, routing_hint, account)
+            .await?;
+        if !matches!(
+            &attempt,
+            WebSocketAttempt::Rejected {
+                status: reqwest::StatusCode::UNAUTHORIZED,
+                ..
+            }
+        ) {
+            return Ok(attempt);
+        }
+
+        tracing::info!(
+            %account,
+            "401 from websocket handshake; forcing token refresh and retrying once"
+        );
+        let refreshed = auth_mgr.force_refresh_headers().await?;
+        self.send_websocket_once(&refreshed, client_headers, routing_hint, account)
+            .await
+    }
+
+    async fn send_websocket_once(
+        &self,
+        auth: &crate::auth::AuthHeaders,
+        client_headers: &reqwest::header::HeaderMap,
+        routing_hint: Option<&reqwest::header::HeaderValue>,
+        account: &str,
+    ) -> Result<WebSocketAttempt, ProxyError> {
+        let client = self.websocket_http.as_ref().map_err(|message| {
+            ProxyError::Upstream(format!("upstream websocket unavailable: {message}"))
+        })?;
+        let mut req = client
+            .get(&self.responses_websocket_url)
+            .header("Authorization", format!("Bearer {}", auth.bearer))
+            .header("originator", &self.originator)
+            .header("User-Agent", &self.user_agent)
+            .header("OpenAI-Beta", RESPONSES_WEBSOCKETS_V2_BETA_HEADER_VALUE);
+
+        if let Some(account_id) = &auth.account_id {
+            req = req.header("ChatGPT-Account-ID", account_id.clone());
+        }
+        if let Some(routing_hint) = routing_hint {
+            req = req.header(X_CODEX_ROUTING_HINT_HEADER, routing_hint.clone());
+        }
+        for name in SESSION_IDENTITY_HEADERS {
+            if let Some(value) = client_headers.get(*name) {
+                req = req.header(*name, value.clone());
+            }
+        }
+        if self.pool.len() == 1 {
+            for name in STICKY_ROUTING_REQUEST_HEADERS {
+                if let Some(value) = client_headers.get(*name) {
+                    req = req.header(*name, value.clone());
+                }
+            }
+        }
+
+        let upgrade = req.upgrade().send().await.map_err(|error| {
+            tracing::warn!(%account, error = %error, "websocket handshake failed");
+            ProxyError::Upstream(format!("websocket handshake failed: {error}"))
+        })?;
+        let status = upgrade.status();
+        if status != reqwest::StatusCode::SWITCHING_PROTOCOLS {
+            let body = upgrade
+                .into_inner()
+                .text()
+                .await
+                .unwrap_or_else(|error| format!("failed to read rejection body: {error}"));
+            return Ok(WebSocketAttempt::Rejected { status, body });
+        }
+
+        let websocket = upgrade.into_websocket().await.map_err(|error| {
+            ProxyError::Upstream(format!(
+                "websocket upgrade validation failed for account {account}: {error}"
+            ))
+        })?;
+        Ok(WebSocketAttempt::Connected(Box::new(websocket)))
+    }
+
     /// Try one pool account: send once, and if the upstream says 401, force a
     /// token refresh and retry once more on this same account before
     /// reporting it as failed.
@@ -293,6 +492,49 @@ impl Upstream {
 }
 
 const X_CODEX_ROUTING_HINT_HEADER: &str = "x-codex-routing-hint";
+const RESPONSES_WEBSOCKETS_V2_BETA_HEADER_VALUE: &str = "responses_websockets=2026-02-06";
+
+fn build_websocket_http_client(cfg: &UpstreamConfig) -> Result<reqwest::Client, reqwest::Error> {
+    let mut builder = reqwest::Client::builder()
+        .use_rustls_tls()
+        .http1_only()
+        .pool_max_idle_per_host(4)
+        .tcp_keepalive(Duration::from_secs(30))
+        .connect_timeout(Duration::from_secs(cfg.connect_timeout_secs))
+        .read_timeout(Duration::from_secs(cfg.request_timeout_secs));
+    if let Some(proxy_url) = &cfg.proxy {
+        builder = builder.proxy(reqwest::Proxy::all(proxy_url)?);
+    }
+    builder.build()
+}
+
+fn websocket_url(http_url: &str) -> String {
+    if let Some(rest) = http_url.strip_prefix("https://") {
+        format!("wss://{rest}")
+    } else if let Some(rest) = http_url.strip_prefix("http://") {
+        format!("ws://{rest}")
+    } else {
+        http_url.to_string()
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn websocket_url_for_test(http_url: &str) -> String {
+    websocket_url(http_url)
+}
+
+fn compact_error_body(body: &str) -> String {
+    const MAX_CHARS: usize = 4096;
+    let mut chars = body.chars();
+    let compact: String = chars.by_ref().take(MAX_CHARS).collect();
+    if chars.next().is_some() {
+        format!("{compact}…")
+    } else if compact.is_empty() {
+        "<empty body>".to_string()
+    } else {
+        compact
+    }
+}
 
 /// Generate the ChatGPT Codex routing hint using the exact current upstream format:
 /// `model=<model>` or `model=<model>;tier=<service_tier>`.
@@ -363,6 +605,7 @@ const SESSION_IDENTITY_HEADERS: &[&str] = &[
     "x-codex-beta-features",
     "x-openai-subagent",
     "x-openai-memgen-request",
+    "x-responsesapi-include-timing-metrics",
 ];
 
 /// Sticky-routing tokens the real Codex CLI captures from a previous

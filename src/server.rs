@@ -8,6 +8,7 @@
 use std::sync::Arc;
 
 use axum::body::Body;
+use axum::extract::ws::WebSocketUpgrade;
 use axum::extract::{DefaultBodyLimit, Path, Request, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
@@ -83,7 +84,9 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/models/:model", get(model_by_id))
         .route(
             "/v1/responses",
-            post(responses).route_layer(auth_layer.clone()),
+            get(responses_websocket)
+                .post(responses)
+                .route_layer(auth_layer.clone()),
         )
         .route(
             "/v1/chat/completions",
@@ -215,6 +218,34 @@ async fn model_by_id(Path(model): Path<String>) -> Response {
         })),
     )
         .into_response()
+}
+
+/// Transparent Responses WebSocket proxy. The downstream upgrade is accepted
+/// immediately so an official Codex client can preconnect; the upstream handshake is
+/// opened after the first `response.create` frame, which supplies the model/service tier
+/// needed for the current official `x-codex-routing-hint` format.
+async fn responses_websocket(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<AccessCtx>,
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+) -> Response {
+    let max_message_bytes = state.config.server.max_body_bytes;
+    let upstream = state.upstream.clone();
+    let metrics = state.metrics.clone();
+    ws.max_message_size(max_message_bytes)
+        .max_frame_size(max_message_bytes)
+        .on_upgrade(move |socket| async move {
+            crate::websocket::proxy_responses(
+                socket,
+                upstream,
+                headers,
+                ctx,
+                metrics,
+                max_message_bytes,
+            )
+            .await;
+        })
 }
 
 /// Passthrough to the Codex Responses API. Streams the upstream response back
