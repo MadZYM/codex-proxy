@@ -4,22 +4,28 @@ import re
 path = Path('/tmp/apply-websocket.py')
 text = path.read_text()
 
-pattern = re.compile(
-    r"'''        let responses_url = format!\(\n.*?\n'''",
-    re.DOTALL,
-)
-matches = list(pattern.finditer(text))
-if len(matches) != 2:
-    raise RuntimeError(f'expected two constructor patch blocks, found {len(matches)}')
 
-correct_target = """'''        let responses_url = format!(
+def replace_two_blocks(pattern_text: str, target: str, replacement: str, discriminator: str) -> None:
+    global text
+    pattern = re.compile(pattern_text, re.DOTALL)
+    matches = list(pattern.finditer(text))
+    if len(matches) != 2:
+        raise RuntimeError(f'expected two patch blocks for {discriminator}, found {len(matches)}')
+    for match in reversed(matches):
+        fixed = replacement if discriminator in match.group(0) else target
+        text = text[:match.start()] + fixed + text[match.end():]
+
+
+replace_two_blocks(
+    r"'''        let responses_url = format!\(\n.*?\n'''",
+    """'''        let responses_url = format!(
             \"{}{}\",
             cfg.base_url.trim_end_matches('/'),
             cfg.responses_path
         );
         let user_agent = build_user_agent(&cfg.originator, &cfg.cli_version);
-'''"""
-correct_replacement = """'''        let responses_url = format!(
+'''""",
+    """'''        let responses_url = format!(
             \"{}{}\",
             cfg.base_url.trim_end_matches('/'),
             cfg.responses_path
@@ -31,14 +37,31 @@ correct_replacement = """'''        let responses_url = format!(
             tracing::error!(%error, \"upstream websocket client unavailable\");
         }
         let user_agent = build_user_agent(&cfg.originator, &cfg.cli_version);
-'''"""
+'''""",
+    'responses_websocket_url',
+)
 
-for match in reversed(matches):
-    replacement = (
-        correct_replacement
-        if 'responses_websocket_url' in match.group(0)
-        else correct_target
-    )
-    text = text[:match.start()] + replacement + text[match.end():]
+replace_two_blocks(
+    r"'''        Self \{\n.*?\n'''",
+    """'''        Self {
+            http,
+            pool,
+            next: AtomicUsize::new(0),
+            account_cooldown: Duration::from_secs(cfg.account_cooldown_secs),
+            responses_url,
+            originator: cfg.originator.clone(),
+'''""",
+    """'''        Self {
+            http,
+            websocket_http,
+            pool,
+            next: AtomicUsize::new(0),
+            account_cooldown: Duration::from_secs(cfg.account_cooldown_secs),
+            responses_url,
+            responses_websocket_url,
+            originator: cfg.originator.clone(),
+'''""",
+    'websocket_http',
+)
 
 path.write_text(text)
