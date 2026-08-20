@@ -35,3 +35,19 @@ replace_once(
     '"response": {"id": response_id}\n',
     '"response": {"id": response_id.clone()}\n',
 )
+
+replace_once(
+    "src/websocket.rs",
+    """                if let UpstreamMessage::Text(text) = &upstream_message
+                    && let Some(completed_usage) = completed_usage(text)
+                {
+                    *usage = Some(completed_usage);
+                }
+""",
+    """                if let UpstreamMessage::Text(text) = &upstream_message {
+                    if let Some(completed_usage) = completed_usage(text) {
+                        *usage = Some(completed_usage);
+                    }
+                }
+""",
+)
