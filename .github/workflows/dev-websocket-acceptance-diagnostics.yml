@@ -55,6 +55,13 @@ jobs:
             if [ "$rc" -ne 0 ]; then status=$rc; fi
           fi
 
+          if [ "$status" -eq 0 ]; then
+            echo '===== apply patch corrections =====' | tee -a .ci-websocket.log
+            python3 .github/ws-fix.py 2>&1 | tee -a .ci-websocket.log
+            rc=${PIPESTATUS[0]}
+            if [ "$rc" -ne 0 ]; then status=$rc; fi
+          fi
+
           run_check() {
             name="$1"
             shift
