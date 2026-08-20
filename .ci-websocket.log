@@ -1,0 +1,8 @@
+===== extract implementation patch =====
+===== apply implementation patch =====
+Traceback (most recent call last):
+  File "/tmp/apply-websocket.py", line 162, in <module>
+    replace_once(
+  File "/tmp/apply-websocket.py", line 8, in replace_once
+    raise RuntimeError(f"{path}: expected one match, found {count}: {old[:120]!r}")
+RuntimeError: src/upstream.rs: expected one match, found 0: '        let responses_url = format!(\n        "{}{}",\n        cfg.base_url.trim_end_matches(\'/\'),\n        cfg.responses_p'
