@@ -31,6 +31,22 @@ replace_once(
 )
 
 replace_once(
+    "src/upstream.rs",
+    "Connected(reqwest_websocket::WebSocket),",
+    "Connected(Box<reqwest_websocket::WebSocket>),",
+)
+replace_once(
+    "src/upstream.rs",
+    "return Ok(ForwardedWebSocket { websocket, account });",
+    "return Ok(ForwardedWebSocket {\n                            websocket: *websocket,\n                            account,\n                        });",
+)
+replace_once(
+    "src/upstream.rs",
+    "Ok(WebSocketAttempt::Connected(websocket))",
+    "Ok(WebSocketAttempt::Connected(Box::new(websocket)))",
+)
+
+replace_once(
     "src/websocket.rs",
     '"response": {"id": response_id}\n',
     '"response": {"id": response_id.clone()}\n',
